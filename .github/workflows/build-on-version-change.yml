@@ -1,0 +1,111 @@
+name: Build on Version Change
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'pubspec.yaml'
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.35.7'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.check.outputs.version_changed }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: 🔍 Check version change
+        id: check
+        run: |
+          # 获取当前版本
+          CURRENT_VERSION=$(grep 'version:' pubspec.yaml | sed 's/version: //' | tr -d ' ')
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "当前版本: $CURRENT_VERSION"
+
+          # 检查是否是版本变更提交
+          if git diff HEAD~1 HEAD -- pubspec.yaml | grep -E '^\+version:' > /dev/null 2>&1; then
+            OLD_VERSION=$(git show HEAD~1:pubspec.yaml | grep 'version:' | sed 's/version: //' | tr -d ' ')
+            if [ "$CURRENT_VERSION" != "$OLD_VERSION" ]; then
+              echo "version_changed=true" >> $GITHUB_OUTPUT
+              echo "::notice::检测到版本变更: $OLD_VERSION → $CURRENT_VERSION"
+            else
+              echo "version_changed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-quick:
+    needs: check-version
+    if: needs.check-version.outputs.version_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions: write-all
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 📦 Get dependencies
+        run: flutter pub get
+
+      - name: 🔍 Analyze
+        run: dart analyze --fatal-infos lib
+
+      - name: 🧪 Test
+        run: flutter test
+
+      - name: 🏗️ Quick Build (Android)
+        run: flutter build apk --release
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quick-Build-${{ needs.check-version.outputs.version }}
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  notify:
+    needs: [check-version, build-quick]
+    if: needs.check-version.outputs.version_changed == 'true' && success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🏷️ Create and push tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          # 从版本号创建 tag (去掉 build number)
+          VERSION_NUMBER=$(echo $VERSION | cut -d'+' -f1)
+          TAG="v$VERSION_NUMBER"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 检查 tag 是否已存在
+          if git tag -l | grep -q "^$TAG$"; then
+            echo "Tag $TAG 已存在，跳过"
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "::notice::已创建 tag: $TAG"
+          fi
