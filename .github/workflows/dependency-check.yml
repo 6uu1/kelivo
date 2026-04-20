@@ -1,0 +1,143 @@
+name: Dependency Check
+
+on:
+  schedule:
+    # 每周一 UTC 3:00 (北京时间 11:00) 检查
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check-flutter:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Check Flutter version
+        id: flutter
+        run: |
+          # 获取当前使用的 Flutter 版本
+          CURRENT_VERSION=$(grep 'FLUTTER_VERSION' .github/workflows/build-stable.yml | head -1 | sed "s/.*'\(.*\)'.*/\1/")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # 获取最新稳定版
+          LATEST_VERSION=$(curl -s https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json | \
+            jq -r '.current_release.stable')
+
+          echo "latest_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "当前版本: $CURRENT_VERSION"
+          echo "最新版本: $LATEST_VERSION"
+
+          if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📋 Create Flutter update issue
+        if: steps.flutter.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > /tmp/issue_body.md << EOF
+          ## 📦 Flutter 版本更新可用
+
+          当前版本: **${{ steps.flutter.outputs.current_version }}**
+          最新版本: **${{ steps.flutter.outputs.latest_version }}**
+
+          ### 需要更新的文件
+          - \`.github/workflows/build-stable.yml\`
+          - \`.github/workflows/pr-check.yml\`
+          - 其他使用 \`FLUTTER_VERSION\` 的 workflow 文件
+
+          ### 更新步骤
+          1. 更新 workflow 文件中的 \`FLUTTER_VERSION\`
+          2. 运行测试确保兼容性
+          3. 合并更新
+
+          ### 变更日志
+          查看 [Flutter 发布说明](https://docs.flutter.dev/release/release-notes)
+
+          ---
+          *此 Issue 由自动化工作流创建*
+          EOF
+
+          gh issue create \
+            --title "📦 Flutter 更新: ${{ steps.flutter.outputs.current_version }} → ${{ steps.flutter.outputs.latest_version }}" \
+            --body-file /tmp/issue_body.md \
+            --label "dependencies,needs-attention"
+
+  check-packages:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: 📦 Get dependencies
+        run: flutter pub get
+
+      - name: 🔍 Check outdated packages
+        id: outdated
+        run: |
+          flutter pub outdated --json > outdated.json || true
+
+          # 检查是否有直接依赖更新
+          OUTDATED_COUNT=$(jq '[.packages[] | select(.isDirectDependency == true and .upgradable.version != null)] | length' outdated.json 2>/dev/null || echo "0")
+
+          echo "outdated_count=$OUTDATED_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$OUTDATED_COUNT" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+
+            # 生成更新列表
+            echo "### 可更新的直接依赖" > /tmp/outdated.md
+            echo "" >> /tmp/outdated.md
+            jq -r '.packages[] | select(.isDirectDependency == true and .upgradable.version != null) | "- **\(.name)**: \(.current.version) → \(.upgradable.version)"' outdated.json >> /tmp/outdated.md || true
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📋 Create package update issue
+        if: steps.outdated.outputs.has_updates == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > /tmp/issue_body.md << EOF
+          ## 📦 依赖包更新可用
+
+          发现 **${{ steps.outdated.outputs.outdated_count }}** 个直接依赖可更新。
+
+          $(cat /tmp/outdated.md)
+
+          ### 更新步骤
+          \`\`\`bash
+          flutter pub upgrade --major-versions
+          flutter analyze
+          flutter test
+          \`\`\`
+
+          > ⚠️ 更新前请检查变更日志，注意破坏性变更
+
+          ---
+          *此 Issue 由自动化工作流创建*
+          EOF
+
+          gh issue create \
+            --title "📦 依赖包更新可用 (${{ steps.outdated.outputs.outdated_count }} 个)" \
+            --body-file /tmp/issue_body.md \
+            --label "dependencies,needs-attention"
+
+      - name: ✅ No updates needed
+        if: steps.outdated.outputs.has_updates != 'true'
+        run: echo "✅ 所有依赖已是最新"
