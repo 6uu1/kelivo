@@ -1,0 +1,352 @@
+name: Auto Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定 tag (如 v1.0.0)'
+        required: true
+        type: string
+
+env:
+  FLUTTER_VERSION: '3.35.7'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📝 Get version info
+        id: version
+        run: |
+          # 确定 tag
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # 从 pubspec.yaml 获取版本
+          PUBSPEC_VERSION=$(grep 'version:' pubspec.yaml | sed 's/version: //' | tr -d ' ')
+
+          echo "version=$PUBSPEC_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          # 检查是否为预发布版本 (包含 -alpha, -beta, -rc 等)
+          if [[ "$TAG" =~ -(alpha|beta|rc|pre|dev) ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "版本: $PUBSPEC_VERSION"
+          echo "标签: $TAG"
+
+  build-android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions: write-all
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 📝 Inject fallback
+        shell: bash
+        run: |
+          mkdir -p lib/secrets
+          cat > lib/secrets/fallback.dart <<'EOF'
+          const String siliconflowFallbackKey = '${{ secrets.SILICONFLOW_KEY }}';
+          EOF
+
+      - name: 🔑 Setup signing
+        if: ${{ secrets.SIGN_KEYSTORE_BASE64 != '' }}
+        env:
+          SIGN_KEYSTORE_BASE64: ${{ secrets.SIGN_KEYSTORE_BASE64 }}
+        run: |
+          echo "$SIGN_KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
+          echo "storeFile=key.jks" >> android/key.properties
+          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}" >> android/key.properties
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/key.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/key.properties
+
+      - name: 🏗️ Build APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: 📦 Rename APK
+        run: |
+          cd build/app/outputs/flutter-apk
+          for file in app-*-release.apk; do
+            abi=$(echo "$file" | sed -E 's/app-(.*)-release\.apk/\1/')
+            mv "$file" "Kelivo_${{ needs.prepare.outputs.tag }}_${abi}.apk"
+          done
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android
+          path: build/app/outputs/flutter-apk/Kelivo_*.apk
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    permissions: write-all
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 📝 Inject fallback
+        shell: bash
+        run: |
+          mkdir -p lib/secrets
+          cat > lib/secrets/fallback.dart <<'EOF'
+          const String siliconflowFallbackKey = '${{ secrets.SILICONFLOW_KEY }}';
+          EOF
+
+      - name: 🏗️ Build Windows
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+      - name: 📦 Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath "Kelivo_${{ needs.prepare.outputs.tag }}_windows.zip"
+
+      - name: 🔧 Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: 📦 Create Installer
+        shell: pwsh
+        run: |
+          $zhLangCompiler = "C:\\Program Files (x86)\\Inno Setup 6\\Languages\\ChineseSimplified.isl"
+          if (Test-Path $zhLangCompiler) {
+            $languagesBlock = @"
+          [Languages]
+          Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          "@
+          } else {
+            $languagesBlock = @"
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+          "@
+          }
+
+          $issContent = @"
+          #define MyAppName "Kelivo"
+          #define MyAppVersion "${{ needs.prepare.outputs.version }}"
+          #define MyAppPublisher "Psyche"
+          #define MyAppExeName "kelivo.exe"
+          [Setup]
+          AppId={{A7B8C9D0-E1F2-4A5B-8C9D-0E1F2A3B4C5D}}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher={#MyAppPublisher}
+          DefaultDirName={autopf}\{#MyAppName}
+          DefaultGroupName={#MyAppName}
+          OutputDir=.
+          OutputBaseFilename=Kelivo_${{ needs.prepare.outputs.tag }}_windows_setup
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesInstallIn64BitMode=x64
+          ArchitecturesAllowed=x64
+          $languagesBlock
+          [Tasks]
+          Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Additional icons:"
+          [Files]
+          Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          [Icons]
+          Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+          Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+          [Run]
+          Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+          "@
+
+          $issContent | Out-File -FilePath "installer.iss" -Encoding utf8BOM
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows
+          path: |
+            Kelivo_*.zip
+            Kelivo_*_setup.exe
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-latest
+    permissions: write-all
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 📝 Inject fallback
+        shell: bash
+        run: |
+          mkdir -p lib/secrets
+          cat > lib/secrets/fallback.dart <<'EOF'
+          const String siliconflowFallbackKey = '${{ secrets.SILICONFLOW_KEY }}';
+          EOF
+
+      - name: 🏗️ Build macOS
+        run: flutter build macos --release
+
+      - name: 📦 Create DMG
+        run: |
+          brew install create-dmg || true
+          create-dmg \
+            --volname "Kelivo" \
+            --app-drop-link 600 185 \
+            "Kelivo_${{ needs.prepare.outputs.tag }}_macos.dmg" \
+            "build/macos/Build/Products/Release/kelivo.app" || \
+          hdiutil create -volname Kelivo -srcfolder build/macos/Build/Products/Release/kelivo.app -ov -format UDZO "Kelivo_${{ needs.prepare.outputs.tag }}_macos.dmg"
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS
+          path: Kelivo_*.dmg
+
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    permissions: write-all
+
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config libgtk-3-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            rpm patchelf libfuse2 file
+
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 📝 Inject fallback
+        shell: bash
+        run: |
+          mkdir -p lib/secrets
+          cat > lib/secrets/fallback.dart <<'EOF'
+          const String siliconflowFallbackKey = '${{ secrets.SILICONFLOW_KEY }}';
+          EOF
+
+      - name: 🏗️ Build Linux
+        run: flutter build linux --release
+
+      - name: 📦 Create AppImage
+        run: |
+          wget -O appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+          mkdir -p AppDir/usr/bin
+          cp -r build/linux/x64/release/bundle/* AppDir/usr/bin/
+
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/kelivo" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          cat > AppDir/kelivo.desktop << EOF
+          [Desktop Entry]
+          Name=Kelivo
+          Exec=kelivo
+          Icon=kelivo
+          Type=Application
+          Categories=Utility;
+          EOF
+
+          install -Dm644 assets/app_icon.png AppDir/kelivo.png || true
+          ARCH=x86_64 ./appimagetool AppDir "Kelivo_${{ needs.prepare.outputs.tag }}_linux.AppImage"
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linux
+          path: Kelivo_*.AppImage
+
+  release:
+    needs: [prepare, build-android, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions: write-all
+
+    steps:
+      - name: 📥 Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 📋 List artifacts
+        run: find artifacts -type f
+
+      - name: 🚀 Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Kelivo ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
